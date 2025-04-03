@@ -2,28 +2,35 @@
 #include <MD_MAX72xx.h>
 #include <SPI.h>
 #include <Preferences.h>
-#include <EEPROM.h> // For persistent storage
+#include <EEPROM.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoOTA.h>
 #include <HTTPClient.h>
+#include <map>
+#include <string>
+#include <WiFiUdp.h> // Include for ArduinoOTA
+
 
 // Function Prototypes
+
 void handleRoot();
-void handleResults();
+void handleResults(); 
 void handleSetIP();
 void resetTimer();
 void updateDisplay();
 void displayElapsedTime(float timeSeconds);
 void countdownBeforeStart();
-void saveResult(int session, float result);
+void saveResult(int session, float result, int deviceId); // Added deviceId
 void loadPreviousResults();
 void printPreviousResults();
 void resetPreviousResults();
-void sendResultToServer(unsigned long scoreMillis);
+void sendResultToServer(unsigned long scoreMillis, int deviceId);
 String getSavedIP();
 void saveIP(String ipAddress);
 void displayOtaProgress(unsigned int progress, unsigned int total);
+void displayOtaMessage(const char* msg); // Function to display OTA status messages
+void handleOtaError(ota_error_t error);
 
 // Define hardware type and number of devices
 #define HARDWARE_TYPE MD_MAX72XX::FC16_HW
@@ -40,8 +47,8 @@ MD_Parola myDisplay = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 #define RESET_BUTTON 36
 
 // WiFi credentials (replace with your actual credentials)
-const char* ssid = "CLPHS_CEC_IOT";
-const char* password = "@ceciot2024";
+const char *ssid = "CLPHS_CEC_IOT";
+const char *password = "@ceciot2024";
 
 WebServer server(80);
 
@@ -55,10 +62,13 @@ bool previousIrState = HIGH;
 bool previousButtonState = HIGH;
 float lastDisplayedTime = -1.0;
 float currentResult = 0.0;
+int wifiResetTimer = 0;
+unsigned long otaStartTime = 0; // Add this
 
 // Persistent storage
 Preferences preferences;
 int sessionNumber = 0;
+int deviceId = 0; // Declare deviceId here
 
 // EEPROM addresses
 #define EEPROM_SIZE 512
@@ -76,427 +86,557 @@ bool isResetting = false;
 bool isOtaUpdating = false; // Flag to indicate OTA update in progress
 
 // Function to get the saved IP address from EEPROM
-String getSavedIP() {
-    String ip = "";
-    for (int i = 0; i < MAX_IP_LENGTH; i++) {
-        char c = EEPROM.read(IP_ADDRESS_START + i);
-        if (c == '\0' || i >= 15) {
-            break;
-        }
-        ip += c;
+String getSavedIP()
+{
+  String ip = "";
+  for (int i = 0; i < MAX_IP_LENGTH; i++)
+  {
+    char c = EEPROM.read(IP_ADDRESS_START + i);
+    if (c == '\0' || i >= 15)
+    {
+      break;
     }
-    return ip;
+    ip += c;
+  }
+  return ip;
 }
 
 // Function to save the IP address to EEPROM
-void saveIP(String ipAddress) {
-    for (int i = 0; i < MAX_IP_LENGTH; i++) {
-        if (i < ipAddress.length()) {
-            EEPROM.write(IP_ADDRESS_START + i, ipAddress[i]);
-        } else {
-            EEPROM.write(IP_ADDRESS_START + i, '\0');
-        }
+void saveIP(String ipAddress)
+{
+  for (int i = 0; i < MAX_IP_LENGTH; i++)
+  {
+    if (i < ipAddress.length())
+    {
+      EEPROM.write(IP_ADDRESS_START + i, ipAddress[i]);
     }
-    EEPROM.commit();
-    Serial.print("Saved IP address: ");
-    Serial.println(ipAddress);
+    else
+    {
+      EEPROM.write(IP_ADDRESS_START + i, '\0');
+    }
+  }
+  EEPROM.commit();
+  Serial.print("Saved IP address: ");
+  Serial.println(ipAddress);
 }
 
 // Function to handle the root web page
-void handleRoot() {
-    String ipAddress = getSavedIP();
-    String html = "<!DOCTYPE html><html><head><title>Timer Settings</title></head><body>";
-    html += "<h1>Timer Settings</h1>";
-    html += "<p>Current POST IP Address: <strong>" + (ipAddress.isEmpty() ? "Not Set" : ipAddress) + "</strong></p>";
-    html += "<h2>Set POST IP Address</h2>";
-    html += "<form action='/setip' method='post'>";
-    html += "<label for='ip'>IP Address:</label>";
-    html += "<input type='text' id='ip' name='ip' maxlength='" + String(MAX_IP_LENGTH - 1) + "'><br><br>";
-    html += "<input type='submit' value='Save IP Address'>";
-    html += "</form>";
-    html += "<p><a href='/results'>View Results</a></p>";
-    html += "</body></html>";
-    server.send(200, "text/html", html);
+void handleRoot()
+{
+  String ipAddress = getSavedIP();
+  String macAddress = WiFi.macAddress(); // Get the MAC address
+  String html = "<!DOCTYPE html><html><head><title>Timer Settings</title></head><body>";
+  html += "<h1>Timer Settings</h1>";
+  html += "<p>Device ID: <strong>" + String(deviceId) + "</strong></p>"; // Display Device ID
+  html += "<p>MAC Address: <strong>" + macAddress + "</strong></p>"; // Display MAC Address
+  html += "<p>Current POST IP Address: <strong>" + (ipAddress.isEmpty() ? "Not Set" : ipAddress) + "</strong></p>";
+  html += "<h2>Set POST IP Address</h2>";
+  html += "<form action='/setip' method='post'>";
+  html += "<label for='ip'>IP Address:</label>";
+  html += "<input type='text' id='ip' name='ip' maxlength='" + String(MAX_IP_LENGTH - 1) + "'><br><br>";
+  html += "<input type='submit' value='Save IP Address'>";
+  html += "</form>";
+  html += "<p><a href='/results'>View Results</a></p>";
+  html += "</body></html>";
+  server.send(200, "text/html", html);
 }
 
 // Function to handle setting the IP address
-void handleSetIP() {
-    if (server.hasArg("ip")) {
-        String newIP = server.arg("ip");
-        saveIP(newIP);
-        server.send(200, "text/plain", "IP address saved: " + newIP);
-    } else {
-        server.send(400, "text/plain", "Error: IP address not provided.");
-    }
+void handleSetIP()
+{
+  if (server.hasArg("ip"))
+  {
+    String newIP = server.arg("ip");
+    saveIP(newIP);
+    server.send(200, "text/plain", "IP address saved: " + newIP);
+  }
+  else
+  {
+    server.send(400, "text/plain", "Error: IP address not provided.");
+  }
 }
 
 // Function to handle the /results web page
 String resultsPage;
-void handleResults() {
-    resultsPage = "<h1>Timer Results</h1><pre>";
-    int startSession = sessionNumber - NUM_STORED_RESULTS + 1;
-    if (startSession < 1) {
-        startSession = 1;
-    }
+void handleResults()
+{
+  resultsPage = "<h1>Timer Results</h1><pre>";
+  int startSession = sessionNumber - NUM_STORED_RESULTS + 1;
+  if (startSession < 1)
+  {
+    startSession = 1;
+  }
 
-    for (int i = 0; i < NUM_STORED_RESULTS; i++) {
-        int currentSessionToDisplay = startSession + i;
-        int index = (currentSessionToDisplay - 1) % NUM_STORED_RESULTS;
-        float result;
-        EEPROM.get(RESULTS_START_ADDRESS + index * RESULT_SIZE, result);
-        resultsPage += "Session [" + String(currentSessionToDisplay) + "]: " + String(result, 3) + "\n";
-    }
-    resultsPage += "</pre><p><a href='/'>Back to Settings</a></p>";
-    server.send(200, "text/html", resultsPage);
+  for (int i = 0; i < NUM_STORED_RESULTS; i++)
+  {
+    int currentSessionToDisplay = startSession + i;
+    int index = (currentSessionToDisplay - 1) % NUM_STORED_RESULTS;
+    float result;
+    EEPROM.get(RESULTS_START_ADDRESS + index * RESULT_SIZE, result);
+    resultsPage += "Session [" + String(currentSessionToDisplay) + "]: " + String(result, 3) + "\n";
+  }
+  resultsPage += "</pre><p><a href='/'>Back to Settings</a></p>";
+  server.send(200, "text/html", resultsPage);
 }
 
-void resetTimer() {
-    Serial.println("Reset button pressed. Resetting timer.");
-    isCounting = false;
-    inDelay = false;
-    hasFinished = false;
-    lastDisplayedTime = -1.0;
+void resetTimer()
+{
+  Serial.println("Reset button pressed. Resetting timer.");
+  isCounting = false;
+  inDelay = false;
+  hasFinished = false;
+  lastDisplayedTime = -1.0;
+  myDisplay.displayClear();
+  myDisplay.print("Saving..");
+  isResetting = true;
+  delay(300);
+  countdownBeforeStart();
+  isResetting = false;
+}
+
+void updateDisplay()
+{
+  if (isCounting)
+  {
+    unsigned long elapsedTime = millis() - startTime;
+    float elapsedSeconds = elapsedTime / 1000.0;
+
+    if (elapsedSeconds != lastDisplayedTime)
+    {
+      displayElapsedTime(elapsedSeconds);
+      lastDisplayedTime = elapsedSeconds;
+    }
+  }
+}
+
+void displayElapsedTime(float timeSeconds)
+{
+  char buffer[10];
+  dtostrf(timeSeconds, 7, 3, buffer);
+  buffer[7] = 's';
+  buffer[8] = '\0';
+
+  myDisplay.setTextAlignment(PA_LEFT);
+  myDisplay.print(buffer);
+}
+
+void countdownBeforeStart()
+{
+  const char *numbers[] = {"3", "2", "1"};
+
+  for (int i = 0; i < 3; i++)
+  {
+    String text = numbers[i];
+
+    for (int dots = 0; dots <= 3; dots++)
+    {
+      text += ".";
+      myDisplay.setTextAlignment(PA_CENTER);
+      myDisplay.print(text.c_str());
+      Serial.println(text);
+      delay(250);
+    }
+  }
+
+  myDisplay.setTextAlignment(PA_CENTER);
+  myDisplay.print("GO!");
+  Serial.println("GO!");
+  delay(1000);
+  myDisplay.displayClear();
+  displayElapsedTime(0.000);
+}
+
+void saveResult(int session, float result, int deviceId)
+{
+  int address = RESULTS_START_ADDRESS + ((session - 1) % NUM_STORED_RESULTS) * RESULT_SIZE;
+  Serial.print("Saving result ");
+  Serial.print(result, 3);
+  Serial.print(" for session ");
+  Serial.print(session);
+  Serial.print(" at EEPROM address ");
+  Serial.println(address);
+  EEPROM.put(address, result);
+  EEPROM.commit();
+
+  unsigned long scoreMillis = static_cast<unsigned long>(result * 1000);
+  sendResultToServer(scoreMillis, deviceId);
+}
+
+void loadPreviousResults()
+{
+  Serial.println("Loading previous results:");
+  for (int i = 0; i < NUM_STORED_RESULTS; i++)
+  {
+    float result;
+    EEPROM.get(RESULTS_START_ADDRESS + i * RESULT_SIZE, result);
+    Serial.print("Session [");
+    Serial.print(i + 1);
+    Serial.print("]: ");
+    Serial.println(result, 3);
+  }
+}
+
+void printPreviousResults()
+{
+  Serial.println("--- Last 5 Timer Results ---");
+  int startSession = sessionNumber - NUM_STORED_RESULTS + 1;
+  if (startSession < 1)
+  {
+    startSession = 1;
+  }
+
+  for (int i = 0; i < NUM_STORED_RESULTS; i++)
+  {
+    int currentSessionToDisplay = startSession + i;
+    int index = (currentSessionToDisplay - 1) % NUM_STORED_RESULTS;
+    float result;
+    EEPROM.get(RESULTS_START_ADDRESS + index * RESULT_SIZE, result);
+    Serial.print("Session [");
+    Serial.print(currentSessionToDisplay);
+    Serial.print("]: ");
+    Serial.println(result, 3);
+  }
+  Serial.println("----------------------------");
+}
+
+void resetPreviousResults()
+{
+  Serial.println("Clearing stored timer results.");
+  for (int i = 0; i < NUM_STORED_RESULTS; i++)
+  {
+    EEPROM.put(RESULTS_START_ADDRESS + i * RESULT_SIZE, 0.0f);
+  }
+  EEPROM.commit();
+  Serial.println("Stored timer results cleared.");
+  loadPreviousResults();
+}
+
+void sendResultToServer(unsigned long scoreMillis, int deviceId)
+{
+  String serverIP = getSavedIP();
+  if (WiFi.status() == WL_CONNECTED && !serverIP.isEmpty())
+  {
+    HTTPClient http;
+    String serverPath = "http://" + serverIP + ":3001/esp/"+String(deviceId)+"/"+ String(scoreMillis) ;
+
+    http.begin(serverPath);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded"); // Or another appropriate header
+
+    int httpResponseCode = http.POST("");
+
+    Serial.print("HTTP Response code: ");
+    Serial.println(httpResponseCode);
+
+    if (httpResponseCode > 0)
+    {
+      String response = http.getString();
+      Serial.println("HTTP Response body: " + response);
+    }
+    else
+    {
+      Serial.print("Error sending POST request to ");
+      Serial.print(serverPath);
+      Serial.print(": ");
+      Serial.println(http.errorToString(httpResponseCode));
+    }
+
+    http.end();
+  }
+  else
+  {
+    Serial.println("WiFi not connected or POST IP not set. Cannot send POST request.");
+  }
+}
+
+void displayOtaMessage(const char* msg) {
     myDisplay.displayClear();
-    myDisplay.print("Saving..");
-    isResetting = true;
-    delay(1000);
-    countdownBeforeStart();
-    isResetting = false;
-}
-
-void updateDisplay() {
-    if (isCounting) {
-        unsigned long elapsedTime = millis() - startTime;
-        float elapsedSeconds = elapsedTime / 1000.0;
-
-        if (elapsedSeconds != lastDisplayedTime) {
-            displayElapsedTime(elapsedSeconds);
-            lastDisplayedTime = elapsedSeconds;
-        }
-    }
-}
-
-void displayElapsedTime(float timeSeconds) {
-    char buffer[10];
-    dtostrf(timeSeconds, 7, 3, buffer);
-    buffer[7] = 's';
-    buffer[8] = '\0';
-
-    myDisplay.setTextAlignment(PA_LEFT);
-    myDisplay.print(buffer);
-}
-
-void countdownBeforeStart() {
-    const char* numbers[] = {"3", "2", "1"};
-
-    for (int i = 0; i < 3; i++) {
-        String text = numbers[i];
-
-        for (int dots = 0; dots <= 3; dots++) {
-            text += ".";
-            myDisplay.setTextAlignment(PA_CENTER);
-            myDisplay.print(text.c_str());
-            Serial.println(text);
-            delay(250);
-        }
-    }
-
     myDisplay.setTextAlignment(PA_CENTER);
-    myDisplay.print("GO!");
-    Serial.println("GO!");
-    delay(1000);
-    myDisplay.displayClear();
-    displayElapsedTime(0.000);
+    myDisplay.print(msg);
 }
 
-void saveResult(int session, float result) {
-    int address = RESULTS_START_ADDRESS + ((session - 1) % NUM_STORED_RESULTS) * RESULT_SIZE;
-    Serial.print("Saving result ");
-    Serial.print(result, 3);
-    Serial.print(" for session ");
-    Serial.print(session);
-    Serial.print(" at EEPROM address ");
-    Serial.println(address);
-    EEPROM.put(address, result);
-    EEPROM.commit();
 
-    unsigned long scoreMillis = static_cast<unsigned long>(result * 1000);
-    sendResultToServer(scoreMillis);
-}
-
-void loadPreviousResults() {
-    Serial.println("Loading previous results:");
-    for (int i = 0; i < NUM_STORED_RESULTS; i++) {
-        float result;
-        EEPROM.get(RESULTS_START_ADDRESS + i * RESULT_SIZE, result);
-        Serial.print("Session [");
-        Serial.print(i + 1);
-        Serial.print("]: ");
-        Serial.println(result, 3);
+void displayOtaProgress(unsigned int progress, unsigned int total)
+{
+    if (total == 0) {
+        Serial.println("Error: Total OTA size is zero.");
+        displayOtaMessage("OTA Error: Size 0!");
+        isOtaUpdating = false;
+        return;
     }
+  isOtaUpdating = true;
+  char buffer[20];
+  int percentage = (progress * 100) / total;
+  sprintf(buffer, "OTA: %d%%", percentage);
+  myDisplay.setTextAlignment(PA_CENTER);
+  myDisplay.print(buffer);
+  Serial.printf("OTA Progress: %u%%\r", percentage);
 }
 
-void printPreviousResults() {
-    Serial.println("--- Last 5 Timer Results ---");
-    int startSession = sessionNumber - NUM_STORED_RESULTS + 1;
-    if (startSession < 1) {
-        startSession = 1;
+void handleOtaError(ota_error_t error) {
+    isOtaUpdating = false; // Ensure flag is reset on any error
+    switch (error) {
+        case OTA_AUTH_ERROR:    displayOtaMessage("OTA Auth Failed");    break;
+        case OTA_BEGIN_ERROR:   displayOtaMessage("OTA Begin Failed");   break;
+        case OTA_CONNECT_ERROR: displayOtaMessage("OTA Connect Failed"); break;
+        case OTA_RECEIVE_ERROR:
+            displayOtaMessage("OTA Receive Failed");
+            Serial.println("OTA Receive Failed");
+            break;
+        case OTA_END_ERROR:     displayOtaMessage("OTA End Failed");       break;
+        default:                displayOtaMessage("OTA Unknown Error");   break;
     }
-
-    for (int i = 0; i < NUM_STORED_RESULTS; i++) {
-        int currentSessionToDisplay = startSession + i;
-        int index = (currentSessionToDisplay - 1) % NUM_STORED_RESULTS;
-        float result;
-        EEPROM.get(RESULTS_START_ADDRESS + index * RESULT_SIZE, result);
-        Serial.print("Session [");
-        Serial.print(currentSessionToDisplay);
-        Serial.print("]: ");
-        Serial.println(result, 3);
-    }
-    Serial.println("----------------------------");
+    Serial.printf("OTA Error[%u]\n", error);
+    delay(3000);
 }
 
-void resetPreviousResults() {
-    Serial.println("Clearing stored timer results.");
-    for (int i = 0; i < NUM_STORED_RESULTS; i++) {
-        EEPROM.put(RESULTS_START_ADDRESS + i * RESULT_SIZE, 0.0f);
+// ==================== MAC Address to Device ID Mapping ====================
+// This is where you define the MAC address to Device ID mapping.
+// IMPORTANT:
+// 1.  Make sure the MAC addresses are in the format "XX:XX:XX:XX:XX:XX" (uppercase).
+// 2.  The Device IDs should be between 1 and 15 (inclusive).
+// 3.  Add a comma and space after each closing curly brace except the last one.
+std::map<std::string, int> macToId = {
+    {"8C:4F:00:2D:7E:DC", 1}, // Example 1
+    {"AA:BB:CC:DD:EE:FF", 2}, // Example 2
+    {"1A:2B:3C:4D:5E:6F", 3}  // Example 3
+};
+
+int getDeviceIdFromMacAddress(const String &mac)
+{
+  // Convert the String to a std::string for map lookup
+  std::string macStdString = std::string(mac.c_str());
+  // Check if the MAC address is in the map.
+  if (macToId.count(macStdString) > 0)
+  {
+    int id = macToId[macStdString];
+    if (id >= 1 && id <= 15)
+    {
+      return id; // Return the ID if it's within the valid range.
     }
-    EEPROM.commit();
-    Serial.println("Stored timer results cleared.");
-    loadPreviousResults();
+    else
+    {
+      Serial.print("Error: Invalid Device ID for MAC ");
+      Serial.print(mac);
+      Serial.print(".  ID must be between 1 and 15.  Setting ID to 0.\n");
+      return 0;
+    }
+  }
+  else
+  {
+    Serial.print("MAC address ");
+    Serial.print(mac);
+    Serial.println(" not found in ID mapping.  Setting ID to 0.");
+    return 0; // Return 0 to indicate not found.
+  }
 }
 
-void sendResultToServer(unsigned long scoreMillis) {
-    String serverIP = getSavedIP();
-    if (WiFi.status() == WL_CONNECTED && !serverIP.isEmpty()) {
-        HTTPClient http;
-        String serverPath = "http://" + serverIP + ":3001/esp/1/" + String(scoreMillis);
+void setup()
+{
+  Serial.begin(115200);
+  myDisplay.begin();
+  myDisplay.setIntensity(1);
+  myDisplay.displayClear();
 
-        http.begin(serverPath);
-        http.addHeader("Content-Type", "application/x-www-form-urlencoded"); // Or another appropriate header
+  preferences.begin("timer_data", false);
+  sessionNumber = preferences.getInt("session_count", 0);
+  sessionNumber++;
+  preferences.putInt("session_count", sessionNumber);
+  preferences.end();
+  Serial.print("Current Session Number: ");
+  Serial.println(sessionNumber);
 
-        int httpResponseCode = http.POST("");
+  EEPROM.begin(EEPROM_SIZE);
 
-        Serial.print("HTTP Response code: ");
-        Serial.println(httpResponseCode);
-
-        if (httpResponseCode > 0) {
-            String response = http.getString();
-            Serial.println("HTTP Response body: " + response);
-        } else {
-            Serial.print("Error sending POST request to ");
-            Serial.print(serverPath);
-            Serial.print(": ");
-            Serial.println(http.errorToString(httpResponseCode));
-        }
-
-        http.end();
-    } else {
-        Serial.println("WiFi not connected or POST IP not set. Cannot send POST request.");
+  // Connect to WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED)
+  {
+    delay(500);
+    if (wifiResetTimer < 11)
+    {
+      wifiResetTimer++;
+      Serial.print(".");
     }
-}
+    else
+    {
+      Serial.println("FAILED TO CONNECT TO WIFI. RESTARTING");
+      ESP.restart();
+    }
+  }
+  Serial.println("");
+  Serial.println("WiFi connected");
+  Serial.print("IP address: ");
+  Serial.println(WiFi.localIP());
 
-void displayOtaProgress(unsigned int progress, unsigned int total) {
+  // Get and assign Device ID based on MAC Address
+  String macAddress = WiFi.macAddress();
+  deviceId = getDeviceIdFromMacAddress(macAddress);
+  Serial.print("Device ID: ");
+  Serial.println(deviceId);
+
+  // Initialize ArduinoOTA
+  ArduinoOTA
+      .setHostname("ambatukms")
+      .setPassword("ChooChooHann0000");
+
+  ArduinoOTA.onStart([]() {
+    Serial.println("Start updating");
+    displayOtaMessage("Start updating...");
     isOtaUpdating = true;
-    char buffer[20];
-    int percentage = (progress * 100) / total;
-    sprintf(buffer, "OTA: %d%%", percentage);
-    myDisplay.setTextAlignment(PA_CENTER);
-    myDisplay.print(buffer);
-    Serial.printf("OTA Progress: %u%%\r", percentage);
+    otaStartTime = millis(); // Record start time
+  });
+  ArduinoOTA.onEnd([]() {
+    Serial.println("\nEnd updating; Rebooting...");
+    displayOtaMessage("Update complete!");
+    delay(2000);
+    isOtaUpdating = false;
+  });
+  ArduinoOTA.onProgress(displayOtaProgress);
+  ArduinoOTA.onError(handleOtaError); // Use the new error handler
+  ArduinoOTA.begin();
+  Serial.println("ArduinoOTA initialized");
+
+  // Set up web server routes
+  server.on("/", handleRoot);
+  server.on("/results", handleResults);
+  server.on("/setip", HTTP_POST, handleSetIP);
+  server.begin();
+  Serial.println("Web server started");
+  Serial.print("Saved POST IP: ");
+  Serial.println(getSavedIP());
+
+  loadPreviousResults();
+  countdownBeforeStart();
+  pinMode(IR_SENSOR, INPUT_PULLUP);
+  pinMode(RESET_BUTTON, INPUT_PULLUP);
+  displayElapsedTime(0.000);
 }
 
-void setup() {
-    Serial.begin(115200);
-    myDisplay.begin();
-    myDisplay.setIntensity(1);
-    myDisplay.displayClear();
+void loop()
+{
+  server.handleClient();
+  ArduinoOTA.handle();
 
-    preferences.begin("timer_data", false);
-    sessionNumber = preferences.getInt("session_count", 0);
+  if (isOtaUpdating)
+  {
+     unsigned long otaElapsedTime = millis() - otaStartTime;
+      if (otaElapsedTime > 60000) { // Check for timeout (e.g., 60 seconds)
+          Serial.println("OTA update timed out. Restarting.");
+          displayOtaMessage("OTA Timeout!");
+          delay(2000);
+          ESP.restart(); // Reset the ESP32
+      }
+    delay(10); // Small delay during OTA to allow display updates
+    return;    // Don't run normal timer logic during OTA
+  }
+
+  int buttonState = digitalRead(RESET_BUTTON);
+  unsigned long currentTime = millis();
+
+  if (buttonState == LOW && previousButtonState == HIGH)
+  {
+    buttonPressStartTime = currentTime;
+    buttonHeld = true;
+    longPressDetected = false;
+    isResetting = false;
+  }
+
+  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 2000))
+  {
+    int remainingSeconds = 5 - ((currentTime - buttonPressStartTime) / 1000);
+    if (remainingSeconds >= 0)
+    {
+      String resetText = "reset in " + String(remainingSeconds);
+      myDisplay.setTextAlignment(PA_CENTER);
+      myDisplay.print(resetText.c_str());
+    }
+  }
+
+  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 5000))
+  {
+    Serial.println("Button held for 5 seconds. Resetting session number and results.");
+    sessionNumber = 1;
+    preferences.putInt("session_count", sessionNumber);
+    preferences.end();
+    Serial.print("Session Number Reset to: ");
+    Serial.println(sessionNumber);
+    resetPreviousResults();
+    resetTimer();
+    longPressDetected = true;
+    isResetting = false;
+  }
+
+  if (buttonState == HIGH && previousButtonState == LOW && !longPressDetected)
+  {
+    resetTimer();
     sessionNumber++;
     preferences.putInt("session_count", sessionNumber);
     preferences.end();
-    Serial.print("Current Session Number: ");
+    Serial.print("Session Number incremented to: ");
     Serial.println(sessionNumber);
+  }
 
-    EEPROM.begin(EEPROM_SIZE);
+  if (buttonState == HIGH)
+  {
+    buttonHeld = false;
+  }
 
-    // Connect to WiFi
-    WiFi.begin(ssid, password);
-    Serial.print("Connecting to WiFi");
-    while (WiFi.status() != WL_CONNECTED) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.println("");
-    Serial.println("WiFi connected");
-    Serial.print("IP address: ");
-    Serial.println(WiFi.localIP());
+  previousButtonState = buttonState;
 
-    // Initialize ArduinoOTA
-    ArduinoOTA
-        .setHostname("ambatukms")
-        .setPassword("ChooChooHann0000");
+  if (hasFinished)
+    return;
 
-    ArduinoOTA.onStart([]() {
-        Serial.println("Start updating");
-        myDisplay.displayClear();
-        myDisplay.setTextAlignment(PA_CENTER);
-        myDisplay.print("OTA Starting...");
-        isOtaUpdating = true;
-    });
-    ArduinoOTA.onEnd([]() {
-        Serial.println("\nEnd updating; Rebooting...");
-        myDisplay.displayClear();
-        myDisplay.setTextAlignment(PA_CENTER);
-        myDisplay.print("OTA Done! Rebooting...");
-        isOtaUpdating = true; // Keep the flag set until reboot
-    });
-    ArduinoOTA.onProgress(displayOtaProgress);
-    ArduinoOTA.onError([](ota_error_t error) {
-        Serial.printf("Error[%u]: ", error);
-        String errorMsg;
-        if (error == OTA_AUTH_ERROR) errorMsg = "Auth Failed";
-        else if (error == OTA_BEGIN_ERROR) errorMsg = "Begin Failed";
-        else if (error == OTA_CONNECT_ERROR) errorMsg = "Connect Failed";
-        else if (error == OTA_RECEIVE_ERROR) errorMsg = "Receive Failed";
-        else if (error == OTA_END_ERROR) errorMsg = "End Failed";
-        else errorMsg = "Unknown Error";
-        Serial.println(errorMsg);
-        myDisplay.displayClear();
-        myDisplay.setTextAlignment(PA_CENTER);
-        myDisplay.print("OTA Error!");
-        delay(3000); // Show error for a bit
-        isOtaUpdating = false;
-    });
+  int irState = digitalRead(IR_SENSOR);
 
-    ArduinoOTA.begin();
-    Serial.println("ArduinoOTA initialized");
-
-    // Set up web server routes
-    server.on("/", handleRoot);
-    server.on("/results", handleResults);
-    server.on("/setip", HTTP_POST, handleSetIP);
-    server.begin();
-    Serial.println("Web server started");
-    Serial.print("Saved POST IP: ");
-    Serial.println(getSavedIP());
-
-    loadPreviousResults();
-    countdownBeforeStart();
-    pinMode(IR_SENSOR, INPUT_PULLUP);
-    pinMode(RESET_BUTTON, INPUT_PULLUP);
-    displayElapsedTime(0.000);
-}
-
-void loop() {
-    server.handleClient();
-    ArduinoOTA.handle();
-
-    if (isOtaUpdating) {
-        delay(10); // Small delay during OTA to allow display updates
-        return;     // Don't run normal timer logic during OTA
-    }
-
-    int buttonState = digitalRead(RESET_BUTTON);
-    unsigned long currentTime = millis();
-
-    if (Serial.available() > 0) {
-        String command = Serial.readStringUntil('\n');
-        command.trim();
-        if (command == "RESULT") {
-            printPreviousResults();
-        }
-    }
-
-    if (buttonState == LOW && previousButtonState == HIGH) {
-        buttonPressStartTime = currentTime;
-        buttonHeld = true;
-        longPressDetected = false;
-        isResetting = false;
-    }
-
-    if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 2000)) {
-        int remainingSeconds = 5 - ((currentTime - buttonPressStartTime) / 1000);
-        if (remainingSeconds >= 0) {
-            String resetText = "reset in " + String(remainingSeconds);
-            myDisplay.setTextAlignment(PA_CENTER);
-            myDisplay.print(resetText.c_str());
-        }
-    }
-
-    if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 5000)) {
-        Serial.println("Button held for 5 seconds. Resetting session number and results.");
-        sessionNumber = 1;
-        preferences.putInt("session_count", sessionNumber);
-        preferences.end();
-        Serial.print("Session Number Reset to: ");
-        Serial.println(sessionNumber);
-        resetPreviousResults();
-        resetTimer();
-        longPressDetected = true;
-        isResetting = false;
-    }
-
-    if (buttonState == HIGH && previousButtonState == LOW && !longPressDetected) {
-        resetTimer();
-        sessionNumber++;
-        preferences.putInt("session_count", sessionNumber);
-        preferences.end();
-        Serial.print("Session Number incremented to: ");
-        Serial.println(sessionNumber);
-    }
-
-    if (buttonState == HIGH) {
-        buttonHeld = false;
-    }
-
-    previousButtonState = buttonState;
-
-    if (hasFinished) return;
-
-int irState = digitalRead(IR_SENSOR);
-
-if (!isResetting && isCounting) {
+  if (!isResetting && isCounting)
+  {
     updateDisplay();
-}
+  }
 
-if (inDelay) {
-    if (currentTime - delayStart >= 300) {
-        inDelay = false;
-        Serial.println("300ms delay ended. IR detection active.");
+  if (inDelay)
+  {
+    if (currentTime - delayStart >= 300)
+    {
+      inDelay = false;
+      Serial.println("300ms delay ended. IR detection active.");
     }
     return;
-}
+  }
 
-if (irState == LOW && previousIrState == HIGH) {
-    if (!isCounting) {
-        startTime = currentTime;
-        isCounting = true;
-        inDelay = true;
-        delayStart = currentTime;
-        Serial.println("Detection! Timer started instantly. Entering 300ms delay...");
-        displayElapsedTime(0.000);
-    } else {
-        Serial.println("Detection 2! Object detected again, waiting for it to move away...");
-        while (digitalRead(IR_SENSOR) == LOW) {
-            if (!isResetting) {
-                updateDisplay();
-            }
-        }
-        unsigned long elapsedTime = currentTime - startTime;
-        float elapsedSeconds = elapsedTime / 1000.0;
-        currentResult = elapsedSeconds;
-        Serial.print("Object left! Total time: ");
-        Serial.print(elapsedSeconds, 3);
-        Serial.println(" s");
-        displayElapsedTime(elapsedSeconds);
-        isCounting = false;
-        hasFinished = true;
-        saveResult(sessionNumber, elapsedSeconds);
+  if (irState == LOW && previousIrState == HIGH)
+  {
+    if (!isCounting)
+    {
+      startTime = currentTime;
+      isCounting = true;
+      inDelay = true;
+      delayStart = currentTime;
+      Serial.println("Detection! Timer started instantly. Entering 300ms delay...");
+      displayElapsedTime(0.000);
     }
-}
+    else
+    {
+      Serial.println("Detection 2! Object detected again, waiting for it to move away...");
+      while (digitalRead(IR_SENSOR) == LOW)
+      {
+        if (!isResetting)
+        {
+          updateDisplay();
+        }
+      }
+      unsigned long elapsedTime = currentTime - startTime;
+      float elapsedSeconds = elapsedTime / 1000.0;
+      currentResult = elapsedSeconds;
+      Serial.print("Object left! Total time: ");
+      Serial.print(elapsedSeconds, 3);
+      Serial.println(" s");
+      displayElapsedTime(elapsedSeconds);
+      isCounting = false;
+      hasFinished = true;
+      saveResult(sessionNumber, elapsedSeconds, deviceId); // Pass deviceId here
+    }
+  }
 
-previousIrState = irState;
+  previousIrState = irState;
 }
