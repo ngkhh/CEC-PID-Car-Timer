@@ -10,6 +10,9 @@
 #include <map>
 #include <string>
 #include <WiFiUdp.h> // Include for ArduinoOTA
+#include <freertos/FreeRTOS.h>
+#include <freertos/task.h>
+
 
 // Function Prototypes
 void handleRoot();
@@ -39,9 +42,8 @@ void sendDataToGoogleSheets(unsigned long scoreMillis, int deviceId); // New fun
 // Create an instance of MD_Parola
 MD_Parola myDisplay = MD_Parola(HARDWARE_TYPE, CS_PIN, MAX_DEVICES);
 
-// Define IR sensor pins
-#define IR_SENSOR_1 32
-#define IR_SENSOR_2 21 // Added second IR sensor
+// Define IR sensor pin
+#define IR_SENSOR 22
 
 // Define reset button pin
 #define RESET_BUTTON 36
@@ -58,13 +60,15 @@ unsigned long delayStart = 0;
 bool isCounting = false;
 bool inDelay = false;
 bool hasFinished = false;
-bool previousIrState1 = HIGH; // Store previous state of IR sensor 1
-bool previousIrState2 = HIGH; // Store previous state of IR sensor 2
+bool previousIrState = HIGH;
 bool previousButtonState = HIGH;
 float lastDisplayedTime = -1.0;
 float currentResult = 0.0;
 int wifiResetTimer = 0;
 unsigned long otaStartTime = 0; // Add this
+volatile bool googleSheetsUploadPending = false;
+volatile unsigned long lastScoreMillis = 0;
+volatile int lastDeviceId = 0;
 
 // Persistent storage
 Preferences preferences;
@@ -193,7 +197,7 @@ void resetTimer()
   hasFinished = false;
   lastDisplayedTime = -1.0;
   myDisplay.displayClear();
-  myDisplay.print("Saving..");
+  myDisplay.print("Resetting..");
   isResetting = true;
   delay(300);
   countdownBeforeStart();
@@ -252,8 +256,50 @@ void countdownBeforeStart()
   displayElapsedTime(0.000);
 }
 
-void saveResult(int session, float result, int deviceId)
-{
+
+void sendDataToGoogleSheetsTask(void *parameter) {
+  // SemaphoreHandle_t mutex = static_cast<SemaphoreHandle_t>(parameter);
+  HTTPClient http;
+  String googleSheetsUrl = String(GOOGLE_SHEETS_URL_BASE) + GOOGLE_SCRIPT_ID + "/exec";
+  String postData = "deviceId=" + String(lastDeviceId) + "&scoreMillis=" + String(lastScoreMillis);
+
+  Serial.println("Starting Google Sheets upload task.");
+
+  // if (xSemaphoreTake(mutex, portMAX_DELAY)) {
+  if (WiFi.status() == WL_CONNECTED) {
+    http.begin(googleSheetsUrl);
+    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+    Serial.print("Google Sheets URL: ");
+    Serial.println(googleSheetsUrl);
+    Serial.print("Google Sheets Data: ");
+    Serial.println(postData);
+
+    int httpResponseCode = http.POST(postData);
+
+    Serial.print("Google Sheets HTTP Response Code: ");
+    Serial.println(httpResponseCode);
+
+    if (httpResponseCode == 200 || httpResponseCode == 302) {
+      String response = http.getString();
+      Serial.println("Google Sheets response: " + response);
+    } else {
+      String response = http.getString();
+      Serial.println("Google Sheets response (error): " + response);
+      Serial.print("Error sending data to Google Sheets: ");
+      Serial.println(http.errorToString(httpResponseCode));
+    }
+    http.end();
+  } else {
+    Serial.println("WiFi not connected. Skipping Google Sheets upload.");
+  }
+  // xSemaphoreGive(mutex);
+  googleSheetsUploadPending = false;
+  vTaskDelete(NULL); // Delete the task when done
+}
+
+
+void saveResult(int session, float result, int deviceId) {
   int address = RESULTS_START_ADDRESS + ((session - 1) % NUM_STORED_RESULTS) * RESULT_SIZE;
   Serial.print("Saving result ");
   Serial.print(result, 3);
@@ -265,9 +311,31 @@ void saveResult(int session, float result, int deviceId)
   EEPROM.commit();
 
   unsigned long scoreMillis = static_cast<unsigned long>(result * 1000);
-  sendResultToServer(scoreMillis, deviceId);
-  sendDataToGoogleSheets(scoreMillis, deviceId); // Send data to Google Sheets
+
+  // Prepare data for Google Sheets upload
+  lastScoreMillis = scoreMillis;
+  lastDeviceId = deviceId;
+
+  // Trigger the Google Sheets upload task
+  if (WiFi.status() == WL_CONNECTED && !googleSheetsUploadPending) {
+    googleSheetsUploadPending = true;
+    xTaskCreate(
+        sendDataToGoogleSheetsTask, /* Task function */
+        "GoogleSheetsTask",          /* Name of task */
+        10000,                     /* Stack size in bytes (adjust as needed) */
+        NULL,                        /* Task input parameter */
+        1,                           /* Priority of the task (lower is less priority) */
+        NULL);                       /* Task handle to keep track of created task */
+    Serial.println("Google Sheets upload task created.");
+  } else if (!WiFi.status() == WL_CONNECTED) {
+    Serial.println("WiFi not connected. Skipping Google Sheets upload.");
+  } else if (googleSheetsUploadPending) {
+    Serial.println("Google Sheets upload already pending. Skipping new request.");
+  }
+
+  sendResultToServer(scoreMillis, deviceId); // Keep the original server send if you need it
 }
+
 
 void loadPreviousResults()
 {
@@ -413,9 +481,9 @@ void handleOtaError(ota_error_t error)
 // ==================== MAC Address to Device ID Mapping ====================
 // This is where you define the MAC address to Device ID mapping.
 // IMPORTANT:
-// 1.  Make sure the MAC addresses are in the format "XX:XX:XX:XX:XX:XX" (uppercase).
-// 2.  The Device IDs should be between 1 and 15 (inclusive).
-// 3.  Add a comma and space after each closing curly brace except the last one.
+// 1.  Make sure the MAC addresses are in the format "XX:XX:XX:XX:XX:XX" (uppercase).
+// 2.  The Device IDs should be between 1 and 15 (inclusive).
+// 3.  Add a comma and space after each closing curly brace except the last one.
 std::map<std::string, int> macToId = {
     {"8C:4F:00:2D:7E:DC", 1}, // Example 1
     {"AA:BB:CC:DD:EE:FF", 2}, // Example 2
@@ -438,7 +506,7 @@ int getDeviceIdFromMacAddress(const String &mac)
     {
       Serial.print("Error: Invalid Device ID for MAC ");
       Serial.print(mac);
-      Serial.print(".  ID must be between 1 and 15.  Setting ID to 0.\n");
+      Serial.print(".  ID must be between 1 and 15.  Setting ID to 0.\n");
       return 0;
     }
   }
@@ -446,16 +514,14 @@ int getDeviceIdFromMacAddress(const String &mac)
   {
     Serial.print("MAC address ");
     Serial.print(mac);
-    Serial.println(" not found in ID mapping.  Setting ID to 0.");
+    Serial.println(" not found in ID mapping.  Setting ID to 0.");
     return 0; // Return 0 to indicate not found.
   }
 }
 
 // Function to send data to Google Sheets
-void sendDataToGoogleSheets(unsigned long scoreMillis, int deviceId)
-{
-  if (WiFi.status() == WL_CONNECTED)
-  {
+void sendDataToGoogleSheets(unsigned long scoreMillis, int deviceId) {
+  if (WiFi.status() == WL_CONNECTED) {
     HTTPClient http;
     String googleSheetsUrl = String(GOOGLE_SHEETS_URL_BASE) + GOOGLE_SCRIPT_ID + "/exec";
     String postData = "deviceId=" + String(deviceId) + "&scoreMillis=" + String(scoreMillis);
@@ -476,22 +542,17 @@ void sendDataToGoogleSheets(unsigned long scoreMillis, int deviceId)
     Serial.print("HTTP Response Code: "); // ***CHECK THE RESPONSE CODE***
     Serial.println(httpResponseCode);
 
-    if (httpResponseCode == 200 || httpResponseCode == 302)
-    {  // Accepting 302 because it works and i dont want to break it again ahhhhhhhh
+    if (httpResponseCode == 200 || httpResponseCode == 302) {  // Accepting 302 because it works and i dont want to break it again ahhhhhhhh
       String response = http.getString();                      // ts pmo
       Serial.println("Google Sheets response: " + response);
-    }
-    else
-    {
+    } else {
       String response = http.getString();  // Get the response, even on error
       Serial.println("Google Sheets response: " + response);
       Serial.print("Error sending data to Google Sheets: ");
       Serial.println(http.errorToString(httpResponseCode));
     }
     http.end();
-  }
-  else
-  {
+  } else {
     Serial.println("WiFi not connected.");
   }
 }
@@ -574,55 +635,47 @@ void setup()
 
   loadPreviousResults();
   countdownBeforeStart();
-  pinMode(IR_SENSOR_1, INPUT_PULLUP); // Initialize both IR sensors
-  pinMode(IR_SENSOR_2, INPUT_PULLUP);
+  pinMode(IR_SENSOR, INPUT_PULLUP);
   pinMode(RESET_BUTTON, INPUT_PULLUP);
   displayElapsedTime(0.000);
 }
 
-void loop()
-{
+void loop() {
   server.handleClient();
   ArduinoOTA.handle();
 
-  if (isOtaUpdating)
-  {
+  if (isOtaUpdating) {
     unsigned long otaElapsedTime = millis() - otaStartTime;
-    if (otaElapsedTime > 60000)
-    { // Check for timeout (e.g., 60 seconds)
+    if (otaElapsedTime > 60000) { // Check for timeout (e.g., 60 seconds)
       Serial.println("OTA update timed out. Restarting.");
       displayOtaMessage("OTA Timeout!");
       delay(2000);
       ESP.restart(); // Reset the ESP32
     }
     delay(10); // Small delay during OTA to allow display updates
-    return;    // Don't run normal timer logic during OTA
+    return;     // Don't run normal timer logic during OTA
   }
 
   int buttonState = digitalRead(RESET_BUTTON);
   unsigned long currentTime = millis();
 
-  if (buttonState == LOW && previousButtonState == HIGH)
-  {
+  if (buttonState == LOW && previousButtonState == HIGH) {
     buttonPressStartTime = currentTime;
     buttonHeld = true;
     longPressDetected = false;
     isResetting = false;
   }
 
-  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 2000))
-  {
+  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 2000)) {
     int remainingSeconds = 5 - ((currentTime - buttonPressStartTime) / 1000);
-    if (remainingSeconds >= 0)
-    {
+    if (remainingSeconds >= 0) {
       String resetText = "reset in " + String(remainingSeconds);
       myDisplay.setTextAlignment(PA_CENTER);
       myDisplay.print(resetText.c_str());
     }
   }
 
-  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 5000))
-  {
+  if (buttonState == LOW && buttonHeld && !longPressDetected && (currentTime - buttonPressStartTime >= 5000)) {
     Serial.println("Button held for 5 seconds. Resetting session number and results.");
     sessionNumber = 1;
     preferences.putInt("session_count", sessionNumber);
@@ -635,8 +688,7 @@ void loop()
     isResetting = false;
   }
 
-  if (buttonState == HIGH && previousButtonState == LOW && !longPressDetected)
-  {
+  if (buttonState == HIGH && previousButtonState == LOW && !longPressDetected) {
     resetTimer();
     sessionNumber++;
     preferences.putInt("session_count", sessionNumber);
@@ -645,8 +697,7 @@ void loop()
     Serial.println(sessionNumber);
   }
 
-  if (buttonState == HIGH)
-  {
+  if (buttonState == HIGH) {
     buttonHeld = false;
   }
 
@@ -655,51 +706,35 @@ void loop()
   if (hasFinished)
     return;
 
-  int irState1 = digitalRead(IR_SENSOR_1);
-  int irState2 = digitalRead(IR_SENSOR_2);
-  //int irState = digitalRead(IR_SENSOR);
+  int irState = digitalRead(IR_SENSOR);
 
-  if (!isResetting && isCounting)
-  {
+  if (!isResetting && isCounting) {
     updateDisplay();
   }
 
-  if (inDelay)
-  {
-    if (currentTime - delayStart >= 300)
-    {
+  if (inDelay) {
+    if (currentTime - delayStart >= 1000) {
       inDelay = false;
-      Serial.println("300ms delay ended. IR detection active.");
+      Serial.println("1000ms delay ended. IR detection active.");
     }
     return;
   }
 
-  // START MODIFIED SECTION
-  if ((irState1 == HIGH && previousIrState1 == LOW) || (irState2 == HIGH && previousIrState2 == LOW)) { //changed from only irState to irState1
-    if (!isCounting)
-    {
+  if (irState == HIGH && previousIrState == LOW) {
+    if (!isCounting) {
       startTime = currentTime;
       isCounting = true;
       inDelay = true;
       delayStart = currentTime;
-      Serial.println("Detection! Timer started instantly. Entering 300ms delay...");
+      Serial.println("Detection! Timer started instantly. Entering 1000ms delay...");
       displayElapsedTime(0.000);
     }
-    else
-    {
-      Serial.println("Detection 2! Object detected again, waiting for it to move away...");
-      // Wait for BOTH sensors to be HIGH (no detection)
-      while (digitalRead(IR_SENSOR_1) == LOW && digitalRead(IR_SENSOR_2) == LOW)
-      {
-        if (!isResetting)
-        {
-          updateDisplay();
-        }
-      }
+    // The following 'else' block is the one you need to modify
+    else {
       unsigned long elapsedTime = currentTime - startTime;
       float elapsedSeconds = elapsedTime / 1000.0;
       currentResult = elapsedSeconds;
-      Serial.print("Object left! Total time: ");
+      Serial.print("Detection 2! Object detected again. Timer stopped. Total time: ");
       Serial.print(elapsedSeconds, 3);
       Serial.println(" s");
       displayElapsedTime(elapsedSeconds);
@@ -708,8 +743,6 @@ void loop()
       saveResult(sessionNumber, elapsedSeconds, deviceId); // Pass deviceId here
     }
   }
-  // END MODIFIED SECTION
 
-  previousIrState1 = irState1; //update previous IR state 1
-  previousIrState2 = irState2; //update previous IR state 2
+  previousIrState = irState;
 }
