@@ -66,7 +66,6 @@ float lastDisplayedTime = -1.0;
 float currentResult = 0.0;
 int wifiResetTimer = 0;
 unsigned long otaStartTime = 0; // Add this
-volatile bool googleSheetsUploadPending = false;
 volatile unsigned long lastScoreMillis = 0;
 volatile int lastDeviceId = 0;
 
@@ -94,6 +93,14 @@ bool buttonHeld = false;
 bool longPressDetected = false;
 bool isResetting = false;
 bool isOtaUpdating = false; // Flag to indicate OTA update in progress
+
+
+QueueHandle_t uploadQueue;
+
+struct UploadData {
+  String deviceId;
+  unsigned long scoreMillis;
+};
 
 // Function to get the saved IP address from EEPROM
 String getSavedIP()
@@ -258,44 +265,33 @@ void countdownBeforeStart()
 
 
 void sendDataToGoogleSheetsTask(void *parameter) {
-  // SemaphoreHandle_t mutex = static_cast<SemaphoreHandle_t>(parameter);
-  HTTPClient http;
-  String googleSheetsUrl = String(GOOGLE_SHEETS_URL_BASE) + GOOGLE_SCRIPT_ID + "/exec";
-  String postData = "deviceId=" + String(lastDeviceId) + "&scoreMillis=" + String(lastScoreMillis);
+  UploadData data;
 
-  Serial.println("Starting Google Sheets upload task.");
+  while (true) {
+    if (xQueueReceive(uploadQueue, &data, portMAX_DELAY) == pdTRUE) {
+      HTTPClient http;
+      String googleSheetsUrl = String(GOOGLE_SHEETS_URL_BASE) + GOOGLE_SCRIPT_ID + "/exec";
+      String postData = "deviceId=" + data.deviceId + "&scoreMillis=" + String(data.scoreMillis);
 
-  // if (xSemaphoreTake(mutex, portMAX_DELAY)) {
-  if (WiFi.status() == WL_CONNECTED) {
-    http.begin(googleSheetsUrl);
-    http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+      if (WiFi.status() == WL_CONNECTED) {
+        http.begin(googleSheetsUrl);
+        http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+        int httpResponseCode = http.POST(postData);
+        Serial.print("Google Sheets HTTP Response Code: ");
+        Serial.println(httpResponseCode);
 
-    Serial.print("Google Sheets URL: ");
-    Serial.println(googleSheetsUrl);
-    Serial.print("Google Sheets Data: ");
-    Serial.println(postData);
-
-    int httpResponseCode = http.POST(postData);
-
-    Serial.print("Google Sheets HTTP Response Code: ");
-    Serial.println(httpResponseCode);
-
-    if (httpResponseCode == 200 || httpResponseCode == 302) {
-      String response = http.getString();
-      Serial.println("Google Sheets response: " + response);
-    } else {
-      String response = http.getString();
-      Serial.println("Google Sheets response (error): " + response);
-      Serial.print("Error sending data to Google Sheets: ");
-      Serial.println(http.errorToString(httpResponseCode));
+        if (httpResponseCode == 200 || httpResponseCode == 302) {
+          String response = http.getString();
+          Serial.println("Success: " + response);
+        } else {
+          Serial.println("Failed: " + http.getString());
+        }
+        http.end();
+      } else {
+        Serial.println("WiFi not connected.");
+      }
     }
-    http.end();
-  } else {
-    Serial.println("WiFi not connected. Skipping Google Sheets upload.");
   }
-  // xSemaphoreGive(mutex);
-  googleSheetsUploadPending = false;
-  vTaskDelete(NULL); // Delete the task when done
 }
 
 
@@ -317,20 +313,12 @@ void saveResult(int session, float result, int deviceId) {
   lastDeviceId = deviceId;
 
   // Trigger the Google Sheets upload task
-  if (WiFi.status() == WL_CONNECTED && !googleSheetsUploadPending) {
-    googleSheetsUploadPending = true;
-    xTaskCreate(
-        sendDataToGoogleSheetsTask, /* Task function */
-        "GoogleSheetsTask",          /* Name of task */
-        10000,                     /* Stack size in bytes (adjust as needed) */
-        NULL,                        /* Task input parameter */
-        1,                           /* Priority of the task (lower is less priority) */
-        NULL);                       /* Task handle to keep track of created task */
+  if (WiFi.status() == WL_CONNECTED) {
+    UploadData upload = { String(lastDeviceId), lastScoreMillis };
+    xQueueSend(uploadQueue, &upload, portMAX_DELAY);    
     Serial.println("Google Sheets upload task created.");
   } else if (!WiFi.status() == WL_CONNECTED) {
     Serial.println("WiFi not connected. Skipping Google Sheets upload.");
-  } else if (googleSheetsUploadPending) {
-    Serial.println("Google Sheets upload already pending. Skipping new request.");
   }
 
   sendResultToServer(scoreMillis, deviceId); // Keep the original server send if you need it
@@ -632,6 +620,10 @@ void setup()
   Serial.println("Web server started");
   Serial.print("Saved POST IP: ");
   Serial.println(getSavedIP());
+
+  uploadQueue = xQueueCreate(5, sizeof(UploadData));
+  xTaskCreate(&sendDataToGoogleSheetsTask, "UploadTask", 10000, NULL, 5, NULL);
+
 
   loadPreviousResults();
   countdownBeforeStart();
