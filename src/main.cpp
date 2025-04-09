@@ -83,7 +83,7 @@ int deviceId = 0; // Declare deviceId here
 #define MAX_IP_LENGTH 16    // Maximum length of an IPv4 address string
 
 // Google Sheets API details (Replace with your actual details)
-const char *GOOGLE_SCRIPT_ID = "AKfycbyGHdfn_395yf3EmQvmi9A46c7CvWnTHJxjwjJXr3bbErK11l3aCrpL90mS1cML3sv4Lw"; // Replace with your Google Apps Script ID
+const char *GOOGLE_SCRIPT_ID = "AKfycbwpUa0yymVmrIUaRdIw2Nwa72_Hv7qX6JS6dxWzw7fBIwgTJhB0AHMD-qPR2N94Ak-e"; // Replace with your Google Apps Script ID
 const char *SHEET_NAME = "Time";       // Replace with your sheet name
 const char *GOOGLE_SHEETS_URL_BASE = "https://script.google.com/macros/s/";
 
@@ -291,6 +291,8 @@ void sendDataToGoogleSheetsTask(void *parameter) {
         Serial.println("WiFi not connected.");
       }
     }
+    delay(1); //dont overload cpu after overloading core
+
   }
 }
 
