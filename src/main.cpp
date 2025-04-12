@@ -445,23 +445,27 @@ void handleOtaError(ota_error_t error)
   switch (error)
   {
   case OTA_AUTH_ERROR:
-    displayOtaMessage("OTA Auth Failed");
+    displayOtaMessage("OTA Failed");
+    Serial.println("OTA Begin Failed");
     break;
   case OTA_BEGIN_ERROR:
-    displayOtaMessage("OTA Begin Failed");
+    displayOtaMessage("OTA Failed");
+    Serial.println("OTA Begin Failed");
     break;
   case OTA_CONNECT_ERROR:
-    displayOtaMessage("OTA Connect Failed");
+    displayOtaMessage("OTA Failed");
+    Serial.println("OTA CONNECT FAILED");
     break;
   case OTA_RECEIVE_ERROR:
-    displayOtaMessage("OTA Receive Failed");
+    displayOtaMessage("OTA Failed");
     Serial.println("OTA Receive Failed");
     break;
   case OTA_END_ERROR:
-    displayOtaMessage("OTA End Failed");
+  Serial.println("OTA END ERROR ");
+    displayOtaMessage("OTA Failed");
     break;
   default:
-    displayOtaMessage("OTA Unknown Error");
+    displayOtaMessage("OTA ??? Error");
     break;
   }
   Serial.printf("OTA Error[%u]\n", error);
@@ -554,6 +558,8 @@ void setup()
   myDisplay.setIntensity(1);
   myDisplay.displayClear();
 
+  pinMode(2,OUTPUT);
+
   preferences.begin("timer_data", false);
   sessionNumber = preferences.getInt("session_count", 0);
   sessionNumber++;
@@ -605,7 +611,7 @@ void setup()
   });
   ArduinoOTA.onEnd([]() {
     Serial.println("\nEnd updating; Rebooting...");
-    displayOtaMessage("Update complete!");
+    displayOtaMessage("Yippee!!!!");
     delay(2000);
     isOtaUpdating = false;
   });
@@ -739,4 +745,9 @@ void loop() {
   }
 
   previousIrState = irState;
+  if (WiFi.status() == WL_CONNECTED){
+    digitalWrite(2,HIGH);
+  }else{
+    digitalWrite(2,LOW);
+  }
 }
